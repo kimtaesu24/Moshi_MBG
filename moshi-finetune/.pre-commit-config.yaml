@@ -1,0 +1,21 @@
+repos:
+  - repo: local
+    hooks:
+      - id: flake8
+        name: flake8
+        language: system
+        # Ignore common virtualenv names
+        entry: bash -c "flake8 --extend-exclude '.venv,venv,.env,env'"
+        pass_filenames: false
+        always_run: true
+      - id: ruff
+        name: ruff
+        language: system
+        entry: bash -c "ruff check"
+        pass_filenames: false
+        always_run: true
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+        name: "nbstripout - remove output cells from Jupyter notebooks"
