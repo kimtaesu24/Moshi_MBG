@@ -5,7 +5,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _has_tensorboard = True
+except (ImportError, ModuleNotFoundError):
+    SummaryWriter = None  # type: ignore[assignment,misc]
+    _has_tensorboard = False
 
 from finetune.args import TrainArgs, WandbArgs
 from finetune.utils import TrainState
@@ -23,12 +28,20 @@ def get_train_logs(
     peak_allocated_mem: float,
     allocated_mem: float,
     train_args: TrainArgs,
+    commitment_loss: float | None = None,
+    vap_loss: float | None = None,
+    face_loss: float | None = None,
 ) -> dict[str, float | int]:
+    prob_real_tokens = (
+        num_real_tokens / state.this_step_tokens
+        if state.this_step_tokens > 0
+        else 0.0
+    )
     metrics = {
         "lr": lr,
         "step": state.step,
         "loss": loss,
-        "prob_real_tokens": num_real_tokens / state.this_step_tokens,
+        "prob_real_tokens": prob_real_tokens,
         "percent_done": 100 * state.step / train_args.max_steps,
         "peak_allocated_mem": peak_allocated_mem / GB,
         "allocated_mem": allocated_mem / GB,
@@ -36,6 +49,18 @@ def get_train_logs(
         "avg_wps": state.avg_wps,
         "eta_in_seconds": state.eta,
     }
+
+    if commitment_loss is not None:
+        metrics["commitment_loss"] = commitment_loss
+    
+    if vap_loss is not None:
+        metrics["vap_loss"] = vap_loss
+    
+    if face_loss is not None:
+        metrics["face_loss"] = face_loss
+
+    if state.this_bc_stats is not None:
+        metrics.update(state.this_bc_stats)
 
     return metrics
 
@@ -73,11 +98,14 @@ def train_log_msg(state: TrainState, logs: dict[str, float | int], loss: float) 
     metrics["step"] = state.step
     metrics["loss"] = loss
 
+    optional_keys = {"vap_loss", "face_loss"}
     parts = []
     for key, fmt, new_name in [
         ("step", "06", None),
         ("percent_done", "03.1f", "done (%)"),
         ("loss", ".3f", None),
+        ("vap_loss", ".3f", None),
+        ("face_loss", ".3f", None),
         ("lr", ".1e", None),
         ("peak_allocated_mem", ".1f", "peak_alloc_mem (GB)"),
         ("allocated_mem", ".1f", "alloc_mem (GB)"),
@@ -85,6 +113,8 @@ def train_log_msg(state: TrainState, logs: dict[str, float | int], loss: float) 
         ("avg_wps", ".1f", "avg_words_per_second"),
         ("eta", "%Y-%m-%d %H:%M:%S", "ETA"),
     ]:
+        if key in optional_keys and key not in metrics:
+            continue
         name = key if new_name is None else new_name
         try:
             parts.append(f"{name}: {metrics[key]:>{fmt}}")
@@ -126,19 +156,20 @@ class MetricsLogger:
         self.is_master = is_master
         self.jsonl_path = dst_dir / f"metrics.{tag}.jsonl"
         self.tb_dir = dst_dir / "tb"
-        self.summary_writer: SummaryWriter | None = None
+        self.is_wandb = wandb_args.project is not None
+        self.summary_writer = None
 
         if not self.is_master:
             return
 
-        filename_suffix = f".{tag}"
-        self.tb_dir.mkdir(exist_ok=True)
-        self.summary_writer = SummaryWriter(
-            log_dir=str(self.tb_dir),
-            max_queue=1000,
-            filename_suffix=filename_suffix,
-        )
-        self.is_wandb = wandb_args.project is not None
+        if _has_tensorboard:
+            filename_suffix = f".{tag}"
+            self.tb_dir.mkdir(exist_ok=True)
+            self.summary_writer = SummaryWriter(
+                log_dir=str(self.tb_dir),
+                max_queue=1000,
+                filename_suffix=filename_suffix,
+            )
 
         if self.is_wandb:
             import wandb
@@ -147,11 +178,22 @@ class MetricsLogger:
                 wandb.login(key=wandb_args.key)
             if wandb_args.offline:
                 os.environ["WANDB_MODE"] = "offline"
+                
+            local_dir = Path(wandb_args.local_dir)
+            '''
+            # hyades_taesoo version (train with)
+            # wandb staging 파일을 로컬 디스크에 써서 NFS I/O 부하 방지
+            # local_dir = Path('./wandb_logs')
+            '''
+            local_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["WANDB_DIR"] = str(local_dir)
+            os.environ["WANDB_CACHE_DIR"] = str(local_dir / "cache")
+            os.environ["WANDB_DATA_DIR"] = str(local_dir / "data")
             if wandb.run is None:
-                logger.info("initializing wandb")
+                logger.info(f"initializing wandb (local_dir={local_dir})")
                 wandb.init(
                     config=config,
-                    dir=dst_dir,
+                    dir=str(local_dir),
                     project=wandb_args.project,
                     job_type="training",
                     name=wandb_args.run_name or dst_dir.name,
@@ -165,14 +207,14 @@ class MetricsLogger:
             return
 
         metrics_to_ignore = {"step"}
-        assert self.summary_writer is not None
-        for key, value in metrics.items():
-            if key in metrics_to_ignore:
-                continue
-            assert isinstance(value, (int, float)), (key, value)
-            self.summary_writer.add_scalar(
-                tag=f"{self.tag}.{key}", scalar_value=value, global_step=step
-            )
+        if self.summary_writer is not None:
+            for key, value in metrics.items():
+                if key in metrics_to_ignore:
+                    continue
+                assert isinstance(value, (int, float)), (key, value)
+                self.summary_writer.add_scalar(
+                    tag=f"{self.tag}.{key}", scalar_value=value, global_step=step
+                )
 
         if self.is_wandb:
             # grouping in wandb is done with /

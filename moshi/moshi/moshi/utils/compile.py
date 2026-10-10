@@ -1,3 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
@@ -128,7 +149,6 @@ def simple_checkpoint(module: torch.nn.Module, *args, **kwargs):
         module_for_sig = module._fsdp_wrapped_module
     else:
         module_for_sig = module
-    assert isinstance(module_for_sig, torch.nn.Module)
     sig = inspect.signature(module_for_sig.forward)
     # We first flatten all arguments to use only *args, to make things easier and because
     # torch.autograd.Function has weird support for kwargs.
@@ -215,6 +235,9 @@ class CUDAGraphed:
         self._output = None
         self._args = None
 
+    def asdict(self):
+        return {}
+
     def __call__(self, *args, **kwargs) -> tp.Any:
         if kwargs:
             raise RuntimeError("Named arguments not supported for now.")
@@ -242,10 +265,7 @@ class CUDAGraphed:
                         )
                     if source.shape != target.shape:
                         raise ValueError(
-                            f"Argument #{idx} had shape {target.shape}, but got shape {source.shape}"
-                            "When using CUDAGraph, every call must be done with exactly the same shapes. "
-                            "Feel free to deactivate with the env variable NO_CUDA_GRAPH=1, or the decorator "
-                            "`with no_cuda_graph():`"
+                            f"Argument #{idx} had shape {target.shape}, but got shae {source.shape}"
                         )
                     target.copy_(source)
                 else:
@@ -275,6 +295,7 @@ class CUDAGraphed:
                     return self.func(*args)
             else:
                 assert self._args is not None
+                assert self._output is not None
                 _match_values_copy_tensors(args, self._args)
                 self._graph.replay()
                 return self._output

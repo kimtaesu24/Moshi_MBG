@@ -1,12 +1,14 @@
 import itertools
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 import numpy as np
 import sphn
+import torch
 import torch.distributed as dist
 
 from finetune.distributed import get_rank
@@ -18,6 +20,27 @@ logger = logging.getLogger("dataset")
 
 AudioChunkPath = tuple[str, float]
 _LOADED_DATASETS: dict[Path, list[AudioChunkPath]] = {}
+_VOICE_SAMPLE_LOOKUP: dict[Path, dict[str, str]] = {}  # jsonl_path -> {basename -> pt_path}
+_VOICE_PROMPT_EMB_CACHE: dict[str, torch.Tensor] = {}  # pt_path -> [V, dim] tensor
+
+
+def _build_voice_sample_lookup(jsonl_file: Path) -> dict[str, str]:
+    """Return a {audio_basename -> voice_sample_pt_path} mapping from a JSONL file."""
+    # Moshiko has no PersonaPlex voice conditioning. Keep the same audio rows.
+    return {}
+
+
+def _load_voice_prompt_emb(pt_path: str) -> Optional[torch.Tensor]:
+    """Load pre-encoded mimi codes for voice prompt. Returns [1, K, T] int64 CPU tensor."""
+    if pt_path in _VOICE_PROMPT_EMB_CACHE:
+        return _VOICE_PROMPT_EMB_CACHE[pt_path]
+    if not os.path.exists(pt_path):
+        logger.warning(f"Voice prompt cache not found: {pt_path}")
+        return None
+    state = torch.load(pt_path, weights_only=False, map_location="cpu")
+    emb = state["cache"]  # [1, K, T] int64 — frozen mimi codes, valid across training steps
+    _VOICE_PROMPT_EMB_CACHE[pt_path] = emb
+    return emb
 
 
 def main_logger_info(message: str) -> None:
@@ -199,6 +222,7 @@ def get_dataset_iterator(
     epoch = 1
     while True:
         for jsonl_file in source.jsonl_files:
+            voice_lookup = _build_voice_sample_lookup(jsonl_file)
             dataset = sphn.dataset_jsonl(
                 str(jsonl_file),
                 duration_sec=instruct_tokenizer.duration_sec,
@@ -215,7 +239,12 @@ def get_dataset_iterator(
                 dataset = dataset.seq(skip=rank, step_by=world_size)
             for sample in dataset:
                 wav = sample["data"][..., : sample["unpadded_len"]]
-                yield instruct_tokenizer(wav, sample["start_time_sec"], sample["path"])
+                path = sample["path"]
+                voice_prompt_emb = None
+                pt_path = voice_lookup.get(os.path.basename(path))
+                if pt_path:
+                    voice_prompt_emb = _load_voice_prompt_emb(pt_path)
+                yield instruct_tokenizer(wav, sample["start_time_sec"], path, voice_prompt_emb)
         if is_finite:
             break
         print(f"Rank {rank} finished epoch {epoch}")
@@ -226,3 +255,87 @@ def interleave_iterators(iterators: list[Iterator], probabilities, rng):
     while True:
         it_id = rng.choice(range(len(iterators)), p=probabilities)
         yield next(iterators[it_id])
+
+
+# ---------------------------------------------------------------------------
+# Raw-audio iterators (no mimi encoding) — used by the batched encode path
+# ---------------------------------------------------------------------------
+
+RawAudioItem = tuple  # (wav: np.ndarray, start_sec: float, path: str, voice_prompt_emb)
+
+
+def get_raw_audio_iterator(
+    source: DataDir | DataFile,
+    instruct_tokenizer: InterleavedTokenizer,
+    rank: int,
+    world_size: int,
+    is_finite: bool,
+    seed: int | None,
+    shuffle_at_epoch: bool,
+) -> Iterator[RawAudioItem]:
+    """Yields (wav, start_sec, path, voice_prompt_emb) without calling mimi.encode.
+    Callers can accumulate batch_size items and encode with one batched mimi.encode call."""
+    epoch = 1
+    while True:
+        for jsonl_file in source.jsonl_files:
+            voice_lookup = _build_voice_sample_lookup(jsonl_file)
+            dataset = sphn.dataset_jsonl(
+                str(jsonl_file),
+                duration_sec=instruct_tokenizer.duration_sec,
+                num_threads=4,
+                sample_rate=instruct_tokenizer.mimi.sample_rate,
+                pad_last_segment=True,
+            )
+            if shuffle_at_epoch:
+                dataset = dataset.shuffle(
+                    with_replacement=False, skip=rank, step_by=world_size, seed=seed
+                )
+                seed += 1
+            else:
+                dataset = dataset.seq(skip=rank, step_by=world_size)
+            for sample in dataset:
+                wav = sample["data"][..., : sample["unpadded_len"]]
+                path = sample["path"]
+                voice_prompt_emb = None
+                pt_path = voice_lookup.get(os.path.basename(path))
+                if pt_path:
+                    voice_prompt_emb = _load_voice_prompt_emb(pt_path)
+                yield wav, sample["start_time_sec"], path, voice_prompt_emb
+        if is_finite:
+            break
+        print(f"Rank {rank} finished epoch {epoch}")
+        epoch += 1
+
+
+def build_raw_dataset(
+    pretrain_data: str,
+    instruct_tokenizer: InterleavedTokenizer,
+    seed: int | None,
+    rank: int,
+    world_size: int,
+    is_eval: bool,
+    shuffle_pretrain: bool = False,
+) -> Iterator[RawAudioItem]:
+    """Like build_dataset but yields raw audio tuples instead of encoded Samples."""
+    sources, probabilities = parse_data_sources(pretrain_data=pretrain_data)
+    shuffle = not is_eval and shuffle_pretrain
+
+    dataset_iterators = [
+        get_raw_audio_iterator(
+            source,
+            instruct_tokenizer=instruct_tokenizer,
+            rank=rank,
+            world_size=world_size,
+            is_finite=is_eval,
+            seed=seed,
+            shuffle_at_epoch=shuffle,
+        )
+        for source in sources
+    ]
+
+    if is_eval:
+        return itertools.chain.from_iterable(dataset_iterators)
+
+    random_seed = np.array((seed, rank))
+    rng = np.random.RandomState(seed=random_seed)
+    return interleave_iterators(dataset_iterators, probabilities=probabilities, rng=rng)

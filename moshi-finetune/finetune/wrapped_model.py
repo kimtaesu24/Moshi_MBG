@@ -6,9 +6,14 @@ from typing import Callable, Union
 import safetensors
 import torch
 import torch.distributed.fsdp.wrap as torch_wrap
-from moshi.models.lm import LMModel
-from moshi.models.loaders import CheckpointInfo, _is_safetensors
-from moshi.modules.transformer import StreamingTransformerLayer
+
+# personaplex_MBG/moshi 패키지에서 임포트
+from moshi.models.lm import LMModel, ScaledEmbedding
+from moshi.models.loaders import get_moshi_lm, _lm_kwargs
+from moshi.models.backchannel_vap import BackchannelModule
+from moshi.models.vap_gpt_module import VapGPTBackchannelModule
+from moshi.modules.transformer import StreamingTransformerLayer, RMSNorm
+
 from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp.api import ShardingStrategy
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
@@ -24,171 +29,247 @@ def main_logger_info(message: str) -> None:
         logger.info(message)
 
 
-def get_fsdp_policy(is_lora: bool) -> Callable[[torch.nn.Module], bool]:
-    """
-    This function instantiates the FSDP wrap policy.
-    - Each Transformers block becomes its own FSDP group so that only a single
-      Transformer block is sharded at a time
-    - If LoRA is enabled, we additionally create separate FSDP sub-groups for
-      every trainable and non-trainable parameter group since this is a
-      requirement for mixed requires_grad=True/False training. See:
-      https://pytorch.org/docs/stable/fsdp.html
+def get_fsdp_policy(freeze_non_embed: bool) -> Callable[[torch.nn.Module], bool]:
+    """FSDP wrap 정책 반환.
+
+    - StreamingTransformerLayer: 자체 FSDP 그룹
+    - ScaledEmbedding, RMSNorm: 자체 FSDP 그룹
     """
 
-    # Each transformer block becomes a FSDP group, each being sharded separately
-    transformer_block_wrap_policy = functools.partial(
-        torch_wrap.transformer_auto_wrap_policy,
-        transformer_layer_cls=(StreamingTransformerLayer,),
+    def _should_wrap(module: torch.nn.Module) -> bool:
+        if isinstance(module, (
+            StreamingTransformerLayer,
+            ScaledEmbedding,
+            RMSNorm,
+            BackchannelModule,
+            VapGPTBackchannelModule,
+        )):
+            return True
+        # Face module: CausalSoftVQContinuousTransformer is dynamically imported at
+        # runtime (its path is set in lm.py __init__), so we check by class name.
+        if type(module).__name__ == "CausalSoftVQContinuousTransformer":
+            return True
+        return False
+
+    base_policy = functools.partial(
+        torch_wrap.lambda_auto_wrap_policy, lambda_fn=_should_wrap
     )
 
-    if not is_lora:
-        return transformer_block_wrap_policy
+    if not freeze_non_embed:
+        return base_policy
 
-    def fsdp_lora_policy_fn(module):
+    def fsdp_mixed_grad_policy_fn(module):
         return all(p.requires_grad for p in module.parameters())
 
-    # For LoRA training, trainable and non-trainable parameters need to be put into
-    # different FSDP groups
-    fsdp_lora_policy = functools.partial(
-        torch_wrap.lambda_auto_wrap_policy, lambda_fn=fsdp_lora_policy_fn
+    fsdp_mixed_policy = functools.partial(
+        torch_wrap.lambda_auto_wrap_policy, lambda_fn=fsdp_mixed_grad_policy_fn
     )
 
-    policies = [fsdp_lora_policy, transformer_block_wrap_policy]
-
+    policies = [fsdp_mixed_policy, base_policy]
     return functools.partial(torch_wrap._or_policy, policies=policies)
 
 
 def log_train_params(model: Union[torch.nn.Module, FullyShardedDataParallel]):
     world_size = get_world_size()
-
     num_params = world_size * sum(p.numel() for p in model.parameters())
     num_train_params = world_size * sum(
         p.numel() for p in model.parameters() if p.requires_grad
     )
-
     main_logger_info(
-        f"{num_train_params:,.0f} out of {num_params:,.0f} parameters are finetuned "
-        f"({num_train_params / num_params * 100:.2f}%)."
+        f"{num_train_params:,.0f} / {num_params:,.0f} 파라미터 학습 중 "
+        f"({num_train_params / num_params * 100:.2f}%)"
     )
 
 
-def initialize_lora_parameters(model: torch.nn.Module, param_dtype: torch.dtype):
-    """
-    Initialize LoRA layers with Kaiming uniform and zeros.
-    See original paper for more info: https://arxiv.org/abs/2106.09685 and
-    original github repo:
-    https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L122
-    """
-    for m_name, module in model.named_modules():
-        if all(p.is_meta for p in module.parameters()):
-            for p_name, param in module.named_parameters():
-                module._parameters[p_name] = torch.nn.Parameter(
-                    torch.empty_like(param, device="cpu", dtype=param_dtype)
-                )
-                param = module._parameters[p_name]
-
-                if m_name.split(".")[-1] == "lora_A":
-                    torch.nn.init.kaiming_uniform_(param, a=math.sqrt(5))
-                elif m_name.split(".")[-1] == "lora_B":
-                    torch.nn.init.zeros_(param)
-                else:
-                    raise ValueError("Only Lora layers should be randomly initialized.")
-
-
 def get_fsdp_model(
-    args: TrainArgs, checkpointer_info: CheckpointInfo
-) -> FullyShardedDataParallel | LMModel:
-    """
-    Initializes and returns a FullyShardedDataParallel (FSDP) LMModel or a non sharded LMModel if one GPU available.
-    Args:
-        args (TrainArgs): A configuration object containing training arguments
-            and settings. Key attributes include:
-            - param_dtype: The data type for model parameters (e.g., "bfloat16", "float32").
-            - gradient_checkpointing: Whether to enable gradient checkpointing.
-            - lora: Configuration for LoRA fine-tuning, including enabling, rank, and scaling.
-            - full_finetuning: Whether to enable full model fine-tuning or only LoRA fine-tuning.
-        checkpointer_info: provide the initial checkpoint to train from.
-    Notes:
-        - The function uses meta-device initialization for memory efficiency.
-        - Then parameters are initialized on the first GPU (rank=0) only.
-    """
-
+    args: TrainArgs,
+    moshi_weight: str,
+    lm_kwargs: dict,
+) -> Union[FullyShardedDataParallel, LMModel]:
+    """Personaplex LMModel을 초기화하고 FSDP로 샤딩하여 반환합니다."""
     if args.param_dtype == "bfloat16":
         param_dtype = torch.bfloat16
     elif args.param_dtype == "float32":
         param_dtype = torch.float32
-
-    with torch.device("meta"):
-        model = checkpointer_info.get_moshi(
-            device="meta",
-            dtype=param_dtype,
-            lm_kwargs_overrides={
-                "gradient_checkpointing": args.gradient_checkpointing,
-                "lora": args.lora.enable,
-                "lora_rank": args.lora.rank,
-                "lora_scaling": args.lora.scaling,
-            },
-            load_weight=False,
-        )
-
-    if get_rank() == 0:
-        moshi_weight = checkpointer_info.moshi_weights
-
-        assert _is_safetensors(moshi_weight), "Model is not safetensors"
-        model_state_dict = safetensors.torch.load_file(moshi_weight)
-
-        logger.info(f"Converting model to dtype {param_dtype} ...")
-
-        for k, v in model_state_dict.items():
-            model_state_dict[k] = v.to(param_dtype)
-
-        model.load_state_dict(model_state_dict, strict=False, assign=True)
-
-        if args.lora.enable and not args.full_finetuning:
-            logger.info("Initializing lora layers ...")
-            # initialize LoRA layers
-            initialize_lora_parameters(model, param_dtype)
-
-        assert not any(p.is_meta for p in model.parameters()), (
-            "All parameters should be initialized by now"
-        )
-        assert all(p.dtype == param_dtype for p in model.parameters()), (
-            f"All parameters should be on {param_dtype}"
-        )
-
-        logger.info("Finished initialization!")
-        param_init_fn = None
     else:
+        raise ValueError(f"지원하지 않는 dtype: {args.param_dtype}")
 
-        def param_init_fn(m):
-            m.to_empty(device=torch.cuda.current_device(), recurse=False)
-            m.to(param_dtype)
+    # get_moshi_lm 대신 LMModel을 직접 인스턴스화 (get_moshi_lm은 filename 문자열을 요구함)
+    with torch.device("cpu"):
+        model = LMModel(device="cpu", dtype=param_dtype, **lm_kwargs)
 
-        assert all(p.is_meta for p in model.parameters()), (
-            "All parameters should be on meta"
-        )
+    main_logger_info("모델 구조 생성 완료, 가중치 로드 중...")
+
+    # CPU RAM OOM 방지를 위해 Rank 0에서만 실제 가중치 로드
+    # FSDP(sync_module_states=True)가 자동으로 설정된 파라미터를 다른 Rank로 브로드캐스트합니다.
+    if get_rank() == 0:
+        with safetensors.safe_open(moshi_weight, framework="pt", device="cpu") as f:
+            state_dict = {k: f.get_tensor(k) for k in f.keys()}
+
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        missing_base = [k for k in missing_keys if not k.startswith("backchannel")]
+        if missing_base or unexpected_keys:
+            raise RuntimeError(
+                f"Moshi checkpoint mismatch: missing={missing_base}, unexpected={unexpected_keys}"
+            )
+        main_logger_info(f"Moshi backbone loaded exactly; {len(missing_keys)} ours parameters initialized")
+
+        del state_dict # RAM 즉시 반환
+
+    model.to(param_dtype)
+
+    main_logger_info("가중치 로드 및 캐스팅 완료")
 
     torch.distributed.barrier()
 
-    # only finetune LoRA parameters and freeze before wrapping
-    if args.lora.enable and not args.full_finetuning:
+    freeze_non_embed = False
+
+    if args.freeze_backbone:
+        if not args.backchannel.enable:
+            raise ValueError(
+                "freeze_backbone=True requires backchannel.enable=True; "
+                "otherwise there are no VAP parameters to train."
+            )
+        for param in model.parameters():
+            param.requires_grad = False
         for name, param in model.named_parameters():
-            if "lora" in name:
+            if "backchannel" in name:
                 param.requires_grad = True
-            elif args.lora.ft_embed and "emb" in name:
+        trainable_backchannel = sum(
+            p.numel() for name, p in model.named_parameters()
+            if "backchannel" in name and p.requires_grad
+        )
+        main_logger_info(
+            "Backbone frozen: training only backchannel/VAP parameters "
+            f"({trainable_backchannel:,} parameters)"
+        )
+
+    elif args.lora.enable:
+        from peft import get_peft_model, LoraConfig, TaskType
+        
+        main_logger_info(f"LoRA 모드 활성화 (Rank={args.lora.rank}, Scaling={args.lora.scaling})")
+        # LLM transformer 레이어만 LoRA 타겟팅.
+        # face_module / backchannel 은 full fine-tuning 이므로 제외.
+        # PEFT는 target_modules가 문자열이면 re.fullmatch(pattern, full_module_key)로 매칭하므로
+        # 네거티브 룩어헤드로 face_module/backchannel 경로를 명시적으로 배제한다.
+        target_modules = (
+            r"(?!.*(face_module|backchannel))"
+            r".*(in_proj|out_proj|linear1|linear2|text_linear|input_proj|linear_in|linear_out)"
+        )
+        
+        peft_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=args.lora.rank,
+            lora_alpha=args.lora.scaling * args.lora.rank,
+            target_modules=target_modules,
+            bias="none",
+        )
+
+        class PeftCompatibleWrapper(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def __getattr__(self, name):
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.model, name)
+
+            def forward(self, input_ids=None, *args, **kwargs):
+                # PEFT → input_ids로 넘김; PEFT-injected kwargs (attention_mask 등) 필터링
+                # 실제 모델 → codes로 받음
+                return self.model(input_ids, step=kwargs.get("step", 0),
+                                  voice_prompt_embs=kwargs.get("voice_prompt_embs", None),
+                                  audio_feat=kwargs.get("audio_feat", None),
+                                  gt_face_motion=kwargs.get("gt_face_motion", None),
+                                  mimi=kwargs.get("mimi", None),
+                                  bc_audio_feats=kwargs.get("bc_audio_feats", None))
+
+        model = PeftCompatibleWrapper(model)
+        model = get_peft_model(model, peft_config)
+
+        # PEFT injects lora_A, lora_B, and other adapter tensors in fp32 by default,
+        # after the base model was already cast to param_dtype.  A single .to() here
+        # ensures every parameter and buffer (including all PEFT additions) is in the
+        # correct dtype before FSDP or cuda() is called.
+        model = model.to(param_dtype)
+
+        # Backchannel and face modules are trained fully (not via LoRA).
+        # target_modules above won't match their layer names, but PEFT may
+        # still freeze them — explicitly re-enable gradients here.
+        for name, param in model.named_parameters():
+            if "backchannel" in name or "face_module" in name:
+                param.requires_grad = True
+
+        if args.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
+            # Gradient Checkpointing과 LoRA(인풋 requires_grad=False) 조합을 위한 설정
+            model.enable_input_require_grads()
+            
+        if get_rank() == 0:
+            model.print_trainable_parameters()
+            
+    elif args.full_finetuning:
+        for param in model.parameters():
+            param.requires_grad = True
+        main_logger_info("Full finetuning: 모든 파라미터 학습 가능")
+    elif args.lora.ft_embed:
+        freeze_non_embed = True
+        for name, param in model.named_parameters():
+            if "emb" in name or "text_emb" in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
+        main_logger_info("ft_embed 모드: 임베딩 레이어만 학습")
     else:
         for param in model.parameters():
             param.requires_grad = True
+        main_logger_info("Full finetuning (fallback): 모든 파라미터 학습 가능")
+
+    if args.freeze_depformer:
+        frozen = sum(
+            p.numel() for name, p in model.named_parameters() if "depformer" in name
+        )
+        for name, param in model.named_parameters():
+            if "depformer" in name:
+                param.requires_grad = False
+        main_logger_info(f"Depformer 동결: {frozen:,}개 파라미터")
+
+    if args.backchannel.enable and args.backchannel.fusion_fp32:
+        # The fusion scalars are tiny and updated with a large LR; in bf16 most Adam
+        # steps round to zero. Keep them (and only them) in fp32.
+        if get_world_size() != 1:
+            raise ValueError("backchannel.fusion_fp32 is supported on a single GPU only "
+                             "(FSDP flat parameters need one dtype)")
+        for name, param in model.named_parameters():
+            if "backchannel_fusion_" in name:
+                param.data = param.data.float()
+        main_logger_info("Fusion parameters kept in fp32")
 
     if get_world_size() == 1:
-        return model.cuda()
+        model = model.cuda()
 
-    auto_wrap_policy = get_fsdp_policy(args.lora.enable)
+        if args.gradient_checkpointing:
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                checkpoint_wrapper,
+                CheckpointImpl,
+                apply_activation_checkpointing,
+            )
+            apply_activation_checkpointing(
+                model,
+                checkpoint_wrapper_fn=functools.partial(
+                    checkpoint_wrapper,
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                ),
+                check_fn=lambda m: isinstance(m, StreamingTransformerLayer),
+            )
+            main_logger_info("Gradient checkpointing 적용 완료 (단일 GPU)")
 
-    main_logger_info(f"Sharding model over {get_world_size()} GPUs ...")
+        log_train_params(model)
+        return model
+
+    auto_wrap_policy = get_fsdp_policy(freeze_non_embed)
+    main_logger_info(f"{get_world_size()}개 GPU에 모델 샤딩 중...")
 
     wrapped_model = FullyShardedDataParallel(
         model,
@@ -198,12 +279,26 @@ def get_fsdp_model(
         limit_all_gathers=True,
         device_id=torch.cuda.current_device(),
         sync_module_states=True,
-        param_init_fn=param_init_fn,
         use_orig_params=True,
     )
 
-    main_logger_info("Model sharded!")
+    main_logger_info("모델 샤딩 완료!")
+
+    if args.gradient_checkpointing:
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+            CheckpointImpl,
+            apply_activation_checkpointing,
+        )
+        apply_activation_checkpointing(
+            wrapped_model,
+            checkpoint_wrapper_fn=functools.partial(
+                checkpoint_wrapper,
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            ),
+            check_fn=lambda m: isinstance(m, StreamingTransformerLayer),
+        )
+        main_logger_info("Gradient checkpointing 적용 완료 (FSDP 후)")
 
     log_train_params(wrapped_model)
-
     return wrapped_model

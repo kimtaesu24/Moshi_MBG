@@ -1,3 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
@@ -14,7 +35,8 @@ import numpy as np
 import torch.nn as nn
 
 from .conv import StreamingConv1d, StreamingConvTranspose1d
-from .streaming import StreamingContainer
+from .streaming import StreamingContainer, StreamingAdd
+from ..utils.compile import torch_compile_lazy
 
 
 class SEANetResnetBlock(StreamingContainer):
@@ -73,6 +95,7 @@ class SEANetResnetBlock(StreamingContainer):
                 ),
             ]
         self.block = nn.Sequential(*block)
+        self.add = StreamingAdd()
         self.shortcut: nn.Module
         if true_skip:
             self.shortcut = nn.Identity()
@@ -89,8 +112,7 @@ class SEANetResnetBlock(StreamingContainer):
 
     def forward(self, x):
         u, v = self.shortcut(x), self.block(x)
-        assert u.shape == v.shape, (u.shape, v.shape, x.shape)
-        return u + v
+        return self.add(u, v)
 
 
 class SEANetEncoder(StreamingContainer):
@@ -235,6 +257,7 @@ class SEANetEncoder(StreamingContainer):
 
         self.model = nn.Sequential(*model)
 
+    @torch_compile_lazy
     def forward(self, x):
         return self.model(x)
 
@@ -387,6 +410,7 @@ class SEANetDecoder(StreamingContainer):
             model += [final_act(**final_activation_params)]
         self.model = nn.Sequential(*model)
 
+    @torch_compile_lazy
     def forward(self, z):
         y = self.model(z)
         return y

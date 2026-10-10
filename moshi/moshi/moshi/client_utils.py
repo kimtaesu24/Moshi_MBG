@@ -26,11 +26,6 @@ def make_log(level: str, msg: str) -> str:
     return prefix + " " + msg
 
 
-def log(level: str, msg: str) -> None:
-    """Log something with a given level."""
-    print(make_log(level, msg))
-
-
 class RawPrinter:
     def __init__(self, stream=sys.stdout, err_stream=sys.stderr):
         self.stream = stream
@@ -214,3 +209,5 @@ class Printer:
 
 
 AnyPrinter = Printer | RawPrinter
+
+

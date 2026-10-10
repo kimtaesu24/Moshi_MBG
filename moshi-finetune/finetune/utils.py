@@ -16,11 +16,17 @@ class TrainState:
     elapsed_time: float = 0.0
     n_seen_tokens: int = 0
     this_step_time: float = 0.0
+    this_step_tokens: int = 0
     begin_step_time: float = 0.0
     this_eval_perplexity: float | None = None
     this_eval_loss: float | None = None
     this_audio_loss: float | None = None
     this_text_loss: float | None = None
+    this_vap_loss: float | None = None
+    this_commitment_loss: float | None = None
+    this_face_loss: float | None = None
+    this_bc_stats: dict | None = None
+    this_eval_epad_metrics: dict | None = None
 
     def start_step(self):
         self.step += 1

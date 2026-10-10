@@ -1,38 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 """Retrieves the pretrained models for Moshi and Mimi."""
-
-from dataclasses import dataclass, field
-import json
 from pathlib import Path
-import warnings
-from huggingface_hub import hf_hub_download
+import logging
 
-try:
-    from huggingface_hub.errors import EntryNotFoundError
-except ImportError:
-    from huggingface_hub.utils import EntryNotFoundError  # pyright: ignore
-from safetensors.torch import load_file
-import sentencepiece
+from safetensors.torch import load_model, load_file
 import torch
-import typing as tp
+
+logger = logging.getLogger(__name__)
+
 from .compression import MimiModel
-from ..conditioners import BaseConditioner, ConditionProvider, ConditionFuser
 from .lm import LMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
 from ..quantization import SplitResidualVectorQuantizer
-from ..modules.lora import replace_all_linear_with_lora, replace_lora_with_linear
-
 
 SAMPLE_RATE = 24000
 FRAME_RATE = 12.5
 
-TEXT_TOKENIZER_NAME = "tokenizer_spm_32k_3.model"
-MOSHI_NAME = "model.safetensors"
-MOSHI_Q8_NAME = "model.q8.safetensors"
-MIMI_NAME = "tokenizer-e351c8d8-checkpoint125.safetensors"
-DEFAULT_REPO = "kyutai/moshiko-pytorch-bf16"
+TEXT_TOKENIZER_NAME = 'tokenizer_spm_32k_3.model'
+MOSHI_NAME = 'model.safetensors'
+MIMI_NAME = 'tokenizer-e351c8d8-checkpoint125.safetensors'
+DEFAULT_REPO = 'kyutai/moshiko-pytorch-bf16'
 
 
 _seanet_kwargs = {
@@ -78,14 +88,6 @@ _transformer_kwargs = {
     "input_dimension": _seanet_kwargs["dimension"],
     "output_dimensions": [_seanet_kwargs["dimension"]],
 }
-_mimi_config = {
-    "sample_rate": 24000,
-    "channels": 1,
-    "frame_rate": 12.5,
-    "seanet": _seanet_kwargs,
-    "quantizer": _quantizer_kwargs,
-    "transformer": _transformer_kwargs,
-}
 
 _lm_kwargs = {
     "dim": 4096,
@@ -108,6 +110,7 @@ _lm_kwargs = {
     "depformer_dim_feedforward": int(4.125 * 1024),
     "depformer_num_heads": 16,
     "depformer_num_layers": 6,
+    "depformer_causal": True,
     "depformer_layer_scale": None,
     "depformer_multi_linear": True,
     "depformer_context": 8,
@@ -116,397 +119,266 @@ _lm_kwargs = {
     "depformer_pos_emb": "none",
     "depformer_weights_per_step": True,
     "delays": [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
+    "backchannel_enabled": False,
 }
-
-
-def hf_get(filename: str | Path, hf_repo: str | None = None,
-           check_local_file_exists: bool = False) -> Path:
-    if isinstance(filename, Path):
-        return filename
-    if filename.startswith("hf://"):
-        parts = filename.removeprefix("hf://").split("/")
-        repo_name = parts[0] + "/" + parts[1]
-        filename = "/".join(parts[2:])
-        return Path(hf_hub_download(repo_name, filename))
-    elif filename.startswith("file://"):
-        # Provide a way to force the read of a local file.
-        filename = filename.removeprefix("file://")
-        return Path(filename)
-    elif hf_repo is not None:
-        if check_local_file_exists:
-            if Path(filename).exists():
-                return Path(filename)
-        return Path(hf_hub_download(hf_repo, filename))
-    else:
-        return Path(filename)
-
-
-@dataclass
-class CheckpointInfo:
-    """
-    Contains the paths to each sub model, along with some extra configuration.
-
-    Args:
-        moshi_weights: path to the checkpoint for the Moshi LM.
-        mimi_weights: path to the checkpoint for the Mimi audio tokenizer.
-        tokenizer: path to the text tokenizer.
-        lm_config: config for instantiating the LM model.
-            Can be None if the original Moshi 7B config should be used.
-        raw_config: raw config, including original keys not intended for the LM.
-        mimi_config: configuration for the Mimi codec.
-        model_type: indicate the intended use, should be `moshi` or `hibiki`.
-        lora_weights: path to an optional checkpoint with lora weights.
-        lm_gen_config: optional default params to use for generation with this model.
-        tts_config: optional TTS specific configuration.
-        stt_config: optional STT specific configuration.
-        model_id: optional dict containing tracability information on the model origin, in particular
-            its signature and epoch.
-    """
-
-    moshi_weights: Path
-    mimi_weights: Path
-    tokenizer: Path
-    lm_config: dict | None = None
-    raw_config: dict | None = None
-    mimi_config: dict | None = None
-    model_type: str = "moshi"
-    lora_weights: Path | None = None
-    lm_gen_config: dict = field(default_factory=dict)
-    tts_config: dict = field(default_factory=dict)
-    stt_config: dict = field(default_factory=dict)
-    model_id: dict = field(default_factory=dict)
-
-    @staticmethod
-    def from_hf_repo(
-        hf_repo: str,
-        moshi_weights: Path | str | None = None,
-        mimi_weights: Path | str | None = None,
-        tokenizer: Path | str | None = None,
-        config_path: Path | str | None = None,
-        mimi_config_path: Path | str | None = None,
-        lora_weights: Path | str | None = None,
-    ) -> "CheckpointInfo":
-        """Downloads the checkpoints from the given repo, along with its config.
-
-        Extra overrides are possible for each of Moshi, Mimi, or the text tokenizer,
-        which should be either a Path to a local file or a string representing a path
-        to a local file or starting with `hf://` for pointing to a file in another repo.
-
-        Finally, a `config_path` can be provided to override the config from the repository.
-        """
-        if config_path is None:
-            try:
-                config_path = hf_hub_download(hf_repo, "config.json")
-            except EntryNotFoundError:
-                # No config.json, which might indicate legacy repository.
-                warnings.warn(
-                    f"Repository {hf_repo} contains no config.json. "
-                    "Assuming this is a Moshi 7B. Support for such repository "
-                    "might be removed in the future."
-                )
-        if config_path is None:
-            moshi_name = MOSHI_NAME
-            mimi_name = MIMI_NAME
-            mimi_config_name = None
-            tokenizer_name = TEXT_TOKENIZER_NAME
-            lm_config = None
-            raw_config = None
-            model_type = "moshi"
-            lm_gen_config = {}
-            tts_config = {}
-            stt_config = {}
-            model_id = {}
-            lora_name = None
-        else:
-            raw_config = json.loads(Path(config_path).read_text())
-            lm_config = dict(raw_config)
-            moshi_name = lm_config.pop("moshi_name", MOSHI_NAME)
-            mimi_name = lm_config.pop("mimi_name", MIMI_NAME)
-            mimi_config_name = lm_config.pop("mimi_config_name", None)
-            tokenizer_name = lm_config.pop("tokenizer_name", TEXT_TOKENIZER_NAME)
-            lora_name = lm_config.pop("lora_name", None)
-            model_type = lm_config.pop("model_type", "moshi")
-            lm_gen_config = lm_config.pop("lm_gen_config", {})
-            tts_config = lm_config.pop("tts_config", {})
-            stt_config = lm_config.pop("stt_config", {})
-            model_id = lm_config.pop("model_id", {})
-
-        if moshi_weights is None:
-            moshi_weights_final = hf_get(moshi_name, hf_repo)
-        else:
-            moshi_weights_final = hf_get(moshi_weights)
-
-        if mimi_weights is None:
-            mimi_weights_final = hf_get(mimi_name, hf_repo)
-        else:
-            mimi_weights_final = hf_get(mimi_weights)
-
-        if tokenizer is None:
-            tokenizer_final = hf_get(tokenizer_name, hf_repo)
-        else:
-            tokenizer_final = hf_get(tokenizer)
-
-        if mimi_config_path is None and mimi_config_name is not None:
-            mimi_config_path = hf_get(mimi_config_name, hf_repo)
-        elif mimi_config_path is not None:
-            mimi_config_path = hf_get(mimi_config_path)
-        if mimi_config_path is None:
-            mimi_config = None
-        else:
-            mimi_config = json.loads(mimi_config_path.read_text())
-
-        if lora_weights is None and lora_name:
-            lora_weights_final = hf_get(lora_name, hf_repo)
-        elif lora_weights is not None:
-            lora_weights_final = hf_get(lora_weights)
-        else:
-            lora_weights_final = None
-
-        return CheckpointInfo(
-            moshi_weights_final,
-            mimi_weights_final,
-            tokenizer_final,
-            lm_config,
-            raw_config,
-            mimi_config,
-            model_type,
-            lora_weights_final,
-            lm_gen_config=lm_gen_config,
-            tts_config=tts_config,
-            stt_config=stt_config,
-            model_id=model_id,
-        )
-
-    def get_mimi(self, device: torch.device | str = "cpu") -> MimiModel:
-        if self.lm_config is None:
-            num_codebooks = 8
-        else:
-            num_codebooks = max(self.lm_config["dep_q"], self.lm_config["n_q"] - self.lm_config["dep_q"])
-        if self.tts_config.get('multistream'):
-            num_codebooks //= 2
-        return get_mimi(
-            self.mimi_weights, self.mimi_config,
-            num_codebooks=num_codebooks, device=device)
-
-    def get_moshi(
-        self,
-        device: torch.device | str = "cpu",
-        dtype: torch.dtype = torch.bfloat16,
-        load_weight: bool = True,
-        **kwargs,
-    ) -> LMModel:
-        model = get_moshi_lm(
-            self.moshi_weights if load_weight else None,
-            lm_kwargs=self.lm_config,
-            device=device,
-            dtype=dtype,
-            lora_weights=self.lora_weights,
-            **kwargs,
-        )
-        if self.model_type == "hibiki":
-            # Sometime the model samples the EOS (2) too early, which we want to ignore.
-            # We keep generating if the input file is not finished, and this is a way
-            # to implicitely replace early EOS with PAD.
-            model.text_emb.weight.data[2] = model.text_emb.weight.data[3]
-        return model
-
-    def get_text_tokenizer(self) -> sentencepiece.SentencePieceProcessor:
-        return sentencepiece.SentencePieceProcessor(str(self.tokenizer))  # type: ignore
 
 
 def _is_safetensors(path: Path | str) -> bool:
     return Path(path).suffix in (".safetensors", ".sft", ".sfts")
 
 
-def get_mimi(
-    filename: str | Path | None, mimi_config: dict | None = None,
-    device: torch.device | str = "cpu", num_codebooks: int = 8
-) -> MimiModel:
-    """Return a pretrained Mimi model, or unintialized if `filename` is None."""
-    if mimi_config is None:
-        mimi_config = _mimi_config
-    encoder = SEANetEncoder(**mimi_config['seanet'])
-    decoder = SEANetDecoder(**mimi_config['seanet'])
+def get_mimi(filename: str | Path,
+             device: torch.device | str = 'cpu') -> MimiModel:
+    """Return a pretrained Mimi model."""
+    encoder = SEANetEncoder(**_seanet_kwargs)
+    decoder = SEANetDecoder(**_seanet_kwargs)
     encoder_transformer = transformer.ProjectedTransformer(
-        device=device, **mimi_config['transformer']
+        device=device, **_transformer_kwargs
     )
     decoder_transformer = transformer.ProjectedTransformer(
-        device=device, **mimi_config['transformer']
+        device=device, **_transformer_kwargs
     )
     quantizer = SplitResidualVectorQuantizer(
-        **mimi_config['quantizer'],
+        **_quantizer_kwargs,
     )
     model = MimiModel(
         encoder,
         decoder,
         quantizer,
-        channels=mimi_config['channels'],
-        sample_rate=mimi_config['sample_rate'],
-        frame_rate=mimi_config['frame_rate'],
-        encoder_frame_rate=mimi_config['sample_rate'] / encoder.hop_length,
+        channels=1,
+        sample_rate=SAMPLE_RATE,
+        frame_rate=FRAME_RATE,
+        encoder_frame_rate=SAMPLE_RATE / encoder.hop_length,
         causal=True,
         resample_method="conv",
         encoder_transformer=encoder_transformer,
         decoder_transformer=decoder_transformer,
     ).to(device=device)
     model.eval()
-    if filename is not None:
-        if _is_safetensors(filename):
-            state = load_file(filename, device=str(device))
-            model.load_state_dict(state)
-        else:
-            pkg = torch.load(filename, "cpu")
-            model.load_state_dict(pkg["model"])
-    model.set_num_codebooks(num_codebooks)
+    if _is_safetensors(filename):
+        load_model(model, filename)
+    else:
+        pkg = torch.load(filename, "cpu")
+        model.load_state_dict(pkg["model"])
+    model.set_num_codebooks(8)
     return model
 
 
 def get_moshi_lm(
     filename: str | Path | None,
-    lm_kwargs: tp.Optional[tp.Dict[str, tp.Any]] = None,
+    copy_missing_weights: bool = True,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
-    lora_weights: str | Path | None = None,
-    fuse_lora: bool = False,
-    lm_kwargs_overrides={},
+    delays=None,
+    cpu_offload: bool = False,
 ) -> LMModel:
-    if lm_kwargs is None:
-        lm_kwargs = _lm_kwargs
-    lm_kwargs = dict(lm_kwargs)
-    assert lm_kwargs is not None
+    """Return a pretrained Moshi LM model.
 
-    if "conditioners" in lm_kwargs:
-        lm_kwargs["condition_provider"] = get_conditioner_provider(
-            lm_kwargs["dim"], device, lm_kwargs
+    Args:
+        filename: Path to model weights.
+        copy_missing_weights: Whether to copy missing weights from existing layers.
+        device: Target device for the model.
+        dtype: Data type for model weights.
+        delays: Optional custom delays configuration.
+        cpu_offload: If True, offload model layers to CPU when GPU memory is
+                     insufficient. Uses accelerate's device_map="auto".
+    """
+    # Copy to avoid mutating a shared/global dict
+    lm_kwargs = dict(_lm_kwargs)
+    lm_kwargs["dep_q"] = 8
+    if delays is not None:
+        lm_kwargs["delays"] = delays
+
+    if cpu_offload and filename is not None:
+        return _get_moshi_lm_with_offload(
+            filename, copy_missing_weights, device, dtype, lm_kwargs
         )
-        del lm_kwargs["conditioners"]
-    if lm_kwargs.get("fuser", None) is not None:
-        lm_kwargs["fuser"] = get_condition_fuser(lm_kwargs)
 
-    lm_kwargs = lm_kwargs | lm_kwargs_overrides
-    assert lm_kwargs is not None
+    # Init with meta device to avoid init dummy memory
+    init_device = "meta" if filename is not None else device
+    model = LMModel(device=init_device, dtype=dtype, **lm_kwargs)
+    if filename is None:
+        model.to(device=device, dtype=dtype)
+        model.eval()
+        return model
 
-    # deprecated params.
-    lm_kwargs.pop("depformer_causal", None)
+    filename = str(filename)
 
-    # moved params
-    if 'demux_second_stream' in lm_kwargs:
-        lm_kwargs['demux_second_text_stream'] = lm_kwargs.pop('demux_second_stream')
-
-    # lora params.
-    lora = lm_kwargs.pop("lora", False)
-    lora_rank = lm_kwargs.pop("lora_rank", 128)
-    lora_scaling = lm_kwargs.pop("lora_scaling", 2.0)
-
-    init_device = device
-    if filename is not None:
-        init_device = torch.device('meta')
-
-    model = LMModel(
-        device=init_device,
-        dtype=dtype,
-        **lm_kwargs)
-
-    if filename is not None:
-        if _is_safetensors(filename):
-            state = load_file(filename, device=str(device))
-            for key, value in state.items():
-                if value.dtype.is_floating_point:
-                    if key.startswith('condition_provider.') or key.startswith('fuser.'):
-                        value = value.float()
-                    else:
-                        value = value.to(dtype)
-                state[key] = value
-            model.load_state_dict(state, assign=True)
-
+    # Load state_dict
+    if filename.endswith(".safetensors"):
+        # safetensors does not support mps directly
+        dev = torch.device(device) if isinstance(device, str) else device
+        if dev.type == "mps":
+            state_dict = load_file(filename, device="cpu")
         else:
-            pkg = torch.load(filename, "cpu",)
-            model.load_state_dict(pkg["fsdp_best_state"]["model"], assign=True)
-
-    if lora:
-        assert not lm_kwargs.get("quantize"), (
-            "LoRA and quantization are incompatible for now."
-        )
-        model = get_lora_moshi(
-            model=model,
-            lora_rank=lora_rank,
-            lora_scaling=lora_scaling,
-            lora_weights=lora_weights,
-            device=device,
-            dtype=dtype,
-            fuse_lora=fuse_lora,
-        )
+            state_dict = load_file(filename, device=dev.type)
     else:
-        assert lora_weights is None, (
-            "`lora` is False, but received some lora_weights to load."
-        )
+        # torch checkpoint
+        with open(filename, "rb") as f:
+            state_dict = torch.load(f, map_location="cpu")
+    # Patch 1: expand depformer self_attn weights if needed
+    model_sd = model.state_dict()
+    for name, tensor in list(state_dict.items()):
+        if "depformer" in name and "self_attn" in name and name in model_sd:
+            if tensor.shape != model_sd[name].shape:
+                print("Expanding %s", name)
+                missing = (
+                    tensor
+                    if copy_missing_weights
+                    else model_sd[name][tensor.shape[0] :]
+                )
+                state_dict[name] = torch.concat([tensor, missing], dim=0)
+
+    # Patch 2: fill missing keys by copying 0..7 -> 8..15 for certain groups
+    if copy_missing_weights:
+        to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
+        for name in model_sd.keys():
+            if name in state_dict:
+                continue
+            replaced = False
+            for old, new in zip(range(8), range(8, 16)):
+                for rep in to_replace:
+                    needle = f"{rep}.{new}."
+                    if needle in name:
+                        src = name.replace(needle, f"{rep}.{old}.")
+                        if src in state_dict:
+                            print(f"Replacing {name} <- {src}")
+                            state_dict[name] = state_dict[src]
+                            replaced = True
+                        break
+                if replaced:
+                    break
+            # A dep_q=8 checkpoint (e.g. moshiko) has depformer_emb.0..6 only, so
+            # depformer_emb.7 (input to the first user codebook step) has no 0..7 source.
+            # It never affects the agent codebooks 0..7; copy depformer_emb.6 so it is defined.
+            if not replaced and "depformer_emb.7." in name:
+                src = name.replace("depformer_emb.7.", "depformer_emb.6.")
+                if src in state_dict:
+                    print(f"Replacing {name} <- {src}")
+                    state_dict[name] = state_dict[src]
+                    replaced = True
+            if not replaced:
+                if not name.startswith("backchannel"):
+                    print(f"Missing {name}")
+
+    # Assign weights to target device
+    dev = torch.device(device) if isinstance(device, str) else device
+    for key in state_dict:
+        state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
+    
+    model.load_state_dict(state_dict, strict=False, assign=True)
     model.eval()
-    return model
+    return model.to(device=device, dtype=dtype)
 
 
-def get_conditioner(
-    output_dim: int, device: torch.device | str, conditioner_cfg: dict
-) -> BaseConditioner:
-    conditioner_type = conditioner_cfg["type"]
-    conditioner_kwargs = conditioner_cfg[conditioner_type]
-    conditioner_kwargs.update({"output_dim": output_dim, "device": device})
-    if conditioner_type == "lut":
-        from ..conditioners.text import LUTConditioner
-        return LUTConditioner(**conditioner_kwargs)
-    elif conditioner_type == "tensor":
-        from ..conditioners.tensors import TensorConditioner
-        return TensorConditioner(**conditioner_kwargs)
-    else:
-        raise RuntimeError(f"Unknow conditioner type {conditioner_type}.")
-
-
-def get_conditioner_provider(
-    output_dim: int, device: torch.device | str, cfg: dict
-) -> ConditionProvider:
-    """Instantiate a conditioning model."""
-    conditioners: tp.Dict[str, BaseConditioner] = {}
-    for cond, cond_cfg in cfg["conditioners"].items():
-        conditioners[cond] = get_conditioner(output_dim, device, cond_cfg)
-    conditioner = ConditionProvider(conditioners, device=device)
-    return conditioner
-
-
-def get_condition_fuser(cfg: dict) -> ConditionFuser:
-    """Instantiate a condition fuser object."""
-    fuser_cfg = cfg["fuser"]
-    fuser_methods = ["sum", "cross", "prepend"]
-    fuse2cond = {k: fuser_cfg.get(k, []) for k in fuser_methods}
-    kwargs = {k: v for k, v in fuser_cfg.items() if k not in fuser_methods}
-    fuser = ConditionFuser(fuse2cond=fuse2cond, **kwargs)
-    return fuser
-
-
-def get_lora_moshi(
-    model: LMModel,
-    lora_weights: str | Path | None,
-    lora_rank: int,
-    lora_scaling: float,
-    dtype: torch.dtype = torch.bfloat16,
-    device: torch.device | str = "cpu",
-    fuse_lora: bool = True,
+def _get_moshi_lm_with_offload(
+    filename: str | Path,
+    copy_missing_weights: bool,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    lm_kwargs: dict,
 ) -> LMModel:
-    init_device = device
-    if lora_weights is not None:
-        init_device = torch.device('meta')
-    replace_all_linear_with_lora(model, lora_rank, lora_scaling, device=init_device)
-    if lora_weights is not None:
-        assert _is_safetensors(lora_weights), "LoRA weights must be a safetensors file."
-        lora_state_dict = load_file(lora_weights, device=str(device))
-        for key, value in lora_state_dict.items():
-            if value.dtype.is_floating_point:
-                value = value.to(dtype=dtype)
-            lora_state_dict[key] = value
-        res = model.load_state_dict(lora_state_dict, strict=False, assign=True)
-        if res.unexpected_keys:
-            raise RuntimeError(
-                f"unexpected_keys in the lora weights: {res.unexpected_keys}"
-            )
-        model = model.to(dtype=dtype, device=device)
-        if fuse_lora:
-            replace_lora_with_linear(model)
+    """Load Moshi LM with CPU offloading using accelerate.
+
+    This function distributes model layers across GPU and CPU based on
+    available GPU memory. Layers that don't fit on GPU are kept on CPU
+    and moved to GPU only during forward pass.
+    """
+    try:
+        from accelerate import infer_auto_device_map, dispatch_model
+    except ImportError:
+        raise ImportError(
+            "CPU offloading requires the 'accelerate' package. "
+            "Install it with: pip install accelerate"
+        )
+
+    filename = str(filename)
+    logger.info("Loading model with CPU offloading enabled")
+
+    # First, create model on CPU to get the architecture
+    model = LMModel(device="cpu", dtype=dtype, **lm_kwargs)
+
+    # Load state_dict to CPU
+    if filename.endswith(".safetensors"):
+        state_dict = load_file(filename, device="cpu")
+    else:
+        with open(filename, "rb") as f:
+            state_dict = torch.load(f, map_location="cpu")
+
+    # Apply weight patches (same as non-offload path)
+    model_sd = model.state_dict()
+    for name, tensor in list(state_dict.items()):
+        if "depformer" in name and "self_attn" in name and name in model_sd:
+            if tensor.shape != model_sd[name].shape:
+                logger.info(f"Expanding {name}")
+                missing = (
+                    tensor
+                    if copy_missing_weights
+                    else model_sd[name][tensor.shape[0]:]
+                )
+                state_dict[name] = torch.concat([tensor, missing], dim=0)
+
+    if copy_missing_weights:
+        to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
+        for name in model_sd.keys():
+            if name in state_dict:
+                continue
+            replaced = False
+            for old, new in zip(range(8), range(8, 16)):
+                for rep in to_replace:
+                    needle = f"{rep}.{new}."
+                    if needle in name:
+                        src = name.replace(needle, f"{rep}.{old}.")
+                        if src in state_dict:
+                            logger.info(f"Replacing {name} <- {src}")
+                            state_dict[name] = state_dict[src]
+                            replaced = True
+                        break
+                if replaced:
+                    break
+            # A dep_q=8 checkpoint (e.g. moshiko) has depformer_emb.0..6 only, so
+            # depformer_emb.7 (input to the first user codebook step) has no 0..7 source.
+            # It never affects the agent codebooks 0..7; copy depformer_emb.6 so it is defined.
+            if not replaced and "depformer_emb.7." in name:
+                src = name.replace("depformer_emb.7.", "depformer_emb.6.")
+                if src in state_dict:
+                    print(f"Replacing {name} <- {src}")
+                    state_dict[name] = state_dict[src]
+                    replaced = True
+            if not replaced:
+                logger.warning(f"Missing {name}")
+
+    model.load_state_dict(state_dict, strict=False, assign=True)
+
+    # Determine target device
+    dev = torch.device(device) if isinstance(device, str) else device
+
+    if dev.type != "cuda":
+        # If not using CUDA, just move to the target device without offloading
+        logger.info(f"CPU offload requested but device is {dev}, skipping offload")
+        model.to(dev)
+        model.eval()
+        return model
+
+    # Infer device map based on available GPU memory
+    device_map = infer_auto_device_map(
+        model,
+        max_memory=None,  # Let accelerate auto-detect available memory
+        no_split_module_classes=["StreamingTransformerLayer"],
+        dtype=dtype,
+    )
+
+    # Log the device distribution
+    gpu_layers = sum(1 for v in device_map.values() if v == 0 or v == "cuda:0")
+    cpu_layers = sum(1 for v in device_map.values() if v == "cpu")
+    logger.info(f"Device map: {gpu_layers} modules on GPU, {cpu_layers} modules on CPU")
+
+    # Dispatch model across devices
+    model = dispatch_model(
+        model,
+        device_map=device_map,
+        offload_dir="offload_weights",  # Directory for disk offload if needed
+    )
+
+    model.eval()
     return model
